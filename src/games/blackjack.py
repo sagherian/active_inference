@@ -38,12 +38,16 @@ class Rank(Enum):
     KING = (10, "K")
     ACE = (11, "A")  # Can be 1 or 11
     
-    def __init__(self, value: int, symbol: str):
-        self.value = value
+    def __init__(self, card_value: int, symbol: str):
+        self.card_value = card_value
         self.symbol = symbol
+    
+    def get_value(self) -> int:
+        """Get the card value for blackjack."""
+        return self.card_value
 
 
-@dataclass
+@dataclass(frozen=True)
 class Card:
     """Represents a playing card."""
     suit: Suit
@@ -54,6 +58,20 @@ class Card:
     
     def __repr__(self) -> str:
         return self.__str__()
+    
+    def get_value(self) -> int:
+        """Get the card value for blackjack."""
+        return self.rank.card_value
+    
+    def __hash__(self) -> int:
+        """Make Card hashable for use in sets and as dict keys."""
+        return hash((self.suit, self.rank))
+    
+    def __eq__(self, other) -> bool:
+        """Check equality between cards."""
+        if not isinstance(other, Card):
+            return False
+        return self.suit == other.suit and self.rank == other.rank
 
 
 class Deck:
@@ -117,7 +135,7 @@ class Hand:
                 aces += 1
                 total += 11
             else:
-                total += card.rank.value
+                total += card.rank.card_value
         
         # Adjust for aces
         while total > 21 and aces > 0:
@@ -142,7 +160,7 @@ class Hand:
         for card in self.cards:
             if card.rank == Rank.ACE:
                 has_ace = True
-            value += card.rank.value
+            value += card.rank.card_value
         
         return has_ace and value <= 21 and (value - 10) >= 0
     
@@ -199,7 +217,7 @@ class BlackjackGameState:
         
         # Dealer up card
         if self.dealer_hand.cards:
-            features.append(self.dealer_hand.cards[0].rank.value)
+            features.append(self.dealer_hand.cards[0].rank.card_value)
         else:
             features.append(0)
         
@@ -489,11 +507,11 @@ class BlackjackGame:
     def get_basic_strategy_action(self, player_hand: Hand) -> BlackjackAction:
         """Get basic strategy action for a given hand."""
         player_value = player_hand.get_value()
-        dealer_up_card = self.dealer_hand.cards[0].rank.value
+        dealer_up_card = self.dealer_hand.cards[0].rank.card_value
         
         # Simplified basic strategy
         if player_hand.can_split():
-            pair_value = player_hand.cards[0].rank.value
+            pair_value = player_hand.cards[0].rank.card_value
             if pair_value in [8, 11]:  # Always split 8s and Aces
                 return BlackjackAction.SPLIT
             elif pair_value == 10:  # Never split 10s

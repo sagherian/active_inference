@@ -14,8 +14,8 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 
-from ..inference.active_inference import ActiveInferenceAgent, LevinianAgent, Action, Observation
-from ..games.blackjack import BlackjackPlayer, BlackjackAction, BlackjackGameState, Hand
+from inference.active_inference import ActiveInferenceAgent, LevinianAgent, Action, Observation
+from games.blackjack import BlackjackPlayer, BlackjackAction, BlackjackGameState, Hand
 
 
 @dataclass
@@ -160,7 +160,7 @@ class BlackjackActiveInferenceAgent(LevinianAgent, BlackjackPlayer):
         
         # Dealer information
         if game_state.dealer_hand.cards:
-            dealer_up_card = game_state.dealer_hand.cards[0].rank.value
+            dealer_up_card = game_state.dealer_hand.cards[0].rank.card_value
             features.extend([
                 dealer_up_card / 14.0,  # Normalized dealer up card
                 1.0 if dealer_up_card == 11 else 0.0  # Ace up
@@ -175,12 +175,16 @@ class BlackjackActiveInferenceAgent(LevinianAgent, BlackjackPlayer):
             game_state.running_count / 50.0  # Normalized running count
         ])
         
-        # Add more features to reach observation_dim
+        # Add more features to reach observation_dim (should be 16 total)
         while len(features) < self.observation_dim:
             features.append(0.0)
         
         # Truncate if too many features
         features = features[:self.observation_dim]
+        
+        # Debug: print tensor dimensions
+        if len(features) != self.observation_dim:
+            print(f"⚠️ Warning: Feature count {len(features)} != observation_dim {self.observation_dim}")
         
         return Observation(
             data=torch.tensor(features, dtype=torch.float32),
@@ -196,7 +200,7 @@ class BlackjackActiveInferenceAgent(LevinianAgent, BlackjackPlayer):
             self.card_memory[card] += 1
             
             # Update deck composition belief
-            rank_value = card.rank.value
+            rank_value = card.rank.card_value
             if rank_value in self.blackjack_beliefs.deck_composition_belief:
                 self.blackjack_beliefs.deck_composition_belief[rank_value] -= 1
         
@@ -205,43 +209,54 @@ class BlackjackActiveInferenceAgent(LevinianAgent, BlackjackPlayer):
         
         for card in cards_seen:
             if card not in self.card_memory or self.card_memory[card] == 1:
-                rank_value = min(card.rank.value, 11)  # Treat face cards as 10
+                rank_value = min(card.rank.card_value, 11)  # Treat face cards as 10
                 if rank_value in card_values:
                     self.blackjack_beliefs.card_count_belief += card_values[rank_value]
     
     def compute_expected_value(self, action: BlackjackAction, game_state: BlackjackGameState) -> float:
         """Compute expected value for an action using the generative model."""
-        obs = self.game_state_to_observation(game_state)
+        try:
+            obs = self.game_state_to_observation(game_state)
+            
+            # Ensure tensor has correct dimensions
+            if obs.data.shape[0] != self.observation_dim:
+                print(f"⚠️ Warning: Observation tensor shape {obs.data.shape} doesn't match observation_dim {self.observation_dim}")
+                return 0.0  # Return neutral value if dimensions don't match
+            
+            with torch.no_grad():
+                model_input = obs.data.unsqueeze(0)
+                model_output = self.blackjack_model(model_input)
+                
+                # Get win probability and expected value
+                outcome_probs = model_output['outcome_probs'][0]
+                expected_value = model_output['expected_value'][0].item()
+                
+                # Adjust based on action
+                if action == BlackjackAction.HIT:
+                    # Risk of busting
+                    bust_prob = self._estimate_bust_probability(game_state)
+                    expected_value *= (1 - bust_prob)
+                
+                elif action == BlackjackAction.DOUBLE:
+                    # Double the bet, double the reward/loss
+                    expected_value *= 2
+                
+                elif action == BlackjackAction.SPLIT:
+                    # Two hands, more complex calculation
+                    expected_value *= 1.5  # Simplified
+                
+                elif action == BlackjackAction.SURRENDER:
+                    expected_value = -0.5  # Lose half the bet
+                
+                elif action == BlackjackAction.STAND:
+                    # Keep current expected value
+                    pass
+            
+            return expected_value
         
-        with torch.no_grad():
-            model_output = self.blackjack_model(obs.data.unsqueeze(0))
-            
-            # Get win probability and expected value
-            outcome_probs = model_output['outcome_probs'][0]
-            expected_value = model_output['expected_value'][0].item()
-            
-            # Adjust based on action
-            if action == BlackjackAction.HIT:
-                # Risk of busting
-                bust_prob = self._estimate_bust_probability(game_state)
-                expected_value *= (1 - bust_prob)
-            
-            elif action == BlackjackAction.DOUBLE:
-                # Double the bet, double the reward/loss
-                expected_value *= 2
-            
-            elif action == BlackjackAction.SPLIT:
-                # Two hands, more complex calculation
-                expected_value *= 1.5  # Simplified
-            
-            elif action == BlackjackAction.SURRENDER:
-                expected_value = -0.5  # Lose half the bet
-            
-            elif action == BlackjackAction.STAND:
-                # Keep current expected value
-                pass
-        
-        return expected_value
+        except Exception as e:
+            print(f"⚠️ Error computing expected value: {e}")
+            return 0.0  # Return neutral value on error
     
     def _estimate_bust_probability(self, game_state: BlackjackGameState) -> float:
         """Estimate probability of busting if hitting."""
@@ -417,28 +432,40 @@ class BlackjackActiveInferenceAgent(LevinianAgent, BlackjackPlayer):
         target_value = torch.tensor([result])
         
         # Forward pass
-        model_output = self.blackjack_model(obs.data.unsqueeze(0))
-        
-        # Compute losses
-        outcome_loss = nn.CrossEntropyLoss()(
-            model_output['outcome_probs'], 
-            target_outcome.unsqueeze(0)
-        )
-        
-        value_loss = nn.MSELoss()(
-            model_output['expected_value'], 
-            target_value.unsqueeze(0)
-        )
-        
-        total_loss = outcome_loss + value_loss
-        
-        # Backward pass
-        self.blackjack_optimizer.zero_grad()
-        total_loss.backward()
-        self.blackjack_optimizer.step()
-        
-        # Perform metacognitive reflection
-        self.metacognitive_reflection()
+        try:
+            obs = self.game_state_to_observation(game_state)
+            
+            # Ensure tensor has correct dimensions
+            if obs.data.shape[0] != self.observation_dim:
+                print(f"⚠️ Warning: Observation tensor shape {obs.data.shape} doesn't match observation_dim {self.observation_dim}")
+                return  # Skip learning if dimensions don't match
+            
+            model_output = self.blackjack_model(obs.data.unsqueeze(0))
+            
+            # Compute losses
+            outcome_loss = nn.CrossEntropyLoss()(
+                model_output['outcome_probs'], 
+                target_outcome.unsqueeze(0)
+            )
+            
+            value_loss = nn.MSELoss()(
+                model_output['expected_value'], 
+                target_value.unsqueeze(0)
+            )
+            
+            total_loss = outcome_loss + value_loss
+            
+            # Backward pass
+            self.blackjack_optimizer.zero_grad()
+            total_loss.backward()
+            self.blackjack_optimizer.step()
+            
+            # Perform metacognitive reflection
+            self.metacognitive_reflection()
+            
+        except Exception as e:
+            print(f"⚠️ Error in learning: {e}")
+            return  # Skip learning on error
     
     def _action_to_tensor(self, action: Action) -> torch.Tensor:
         """Convert action to tensor representation."""
